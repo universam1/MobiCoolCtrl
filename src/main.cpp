@@ -1,11 +1,24 @@
 #include <Arduino.h>
 #include <stdio.h>
+#include <Thermistor.h>
+#include <NTC_Thermistor.h>
+#include <SmoothThermistor.h>
+
+#define SENSOR_PIN A1
+#define REFERENCE_RESISTANCE 76000
+#define NOMINAL_RESISTANCE 100000
+#define NOMINAL_TEMPERATURE 25
+#define B_VALUE 3950
+#define SMOOTHING_FACTOR 5
+
+Thermistor *thermistor = NULL;
+
 static int serial_putc(const char c, FILE *stream) { return Serial.write(c); }
 static FILE *serial_stream = fdevopen(serial_putc, NULL);
 
 #define PIN_SENSE 2            // where we connected the fan sense pin. Must be an interrupt capable pin (2 or 3 on Arduino Uno)
 #define PIN_PWM 9              // where we connected the fan PWM pin
-#define DEBOUNCE 0             // 0 is fine for most fans, crappy fans may require 10 or 20 to filter out noise
+#define DEBOUNCE 20            // 0 is fine for most fans, crappy fans may require 10 or 20 to filter out noise
 #define FANSTUCK_THRESHOLD 500 // if no interrupts were received for 500ms, consider the fan as stuck and report 0 RPM
 // Interrupt handler. Stores the timestamps of the last 2 interrupts and handles debouncing
 unsigned long volatile ts1 = 0, ts2 = 0;
@@ -97,19 +110,40 @@ void setup()
   // note that pin 11 will be unavailable for output in this mode!
   // example...
   setPWMpin(PIN_PWM, 0.0f); // set duty to 50% on pin 9
+  Thermistor *originThermistor = new NTC_Thermistor(
+      SENSOR_PIN,
+      REFERENCE_RESISTANCE,
+      NOMINAL_RESISTANCE,
+      NOMINAL_TEMPERATURE,
+      B_VALUE);
+  thermistor = new SmoothThermistor(originThermistor, SMOOTHING_FACTOR);
 }
-
+float mapfloat(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+#define MIN_T 22.0
+#define MIN_PWM 0.3
+#define MAX_T 35.0
+#define MAX_PWM 1.0
 void loop()
 {
-  delay(100);
+  delay(200);
   auto rpm = calcRPM();
-  printf("RPM: %lu\n", rpm);
+  auto pwm = getPWMpin(PIN_PWM);
+  float celsius = thermistor->readCelsius();
+
+  printf("RPM: %lu PWM: %u  T:", rpm, (uint16_t)(pwm * 100));
+  Serial.println(celsius);
   // increase the duty cycle by 2% every until fan is spinning
   if (rpm == 0)
   {
-    auto pwm = getPWMpin(PIN_PWM) + 0.02f;
-    printf("increasing PWM: %f\n", pwm);
-    setPWMpin(PIN_PWM, pwm);
+    printf("increasing PWM: %u\n", (uint16_t)(pwm * 100));
+    setPWMpin(PIN_PWM, pwm + 0.02f);
     return;
   }
+
+  pwm = mapfloat(celsius, MIN_T, MAX_T, MIN_PWM, MAX_PWM);
+  setPWMpin(PIN_PWM, pwm);
 }
+
