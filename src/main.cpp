@@ -4,10 +4,14 @@
 #include <NTC_Thermistor.h>
 #include <SmoothThermistor.h>
 #include <EEPROM.h>
-
+#include <PrintEx.h>
 #include "RunningMedian.h"
 
-RunningMedian rpmSamples = RunningMedian(5);
+#define MIN_T 20.0
+#define MIN_RPM 500.0
+#define MAX_T 35.0
+#define MAX_PWM 1.0
+#define STABILIZE_TIME 10000
 #define SENSOR_PIN A1
 #define REFERENCE_RESISTANCE 76000
 #define NOMINAL_RESISTANCE 100000
@@ -15,22 +19,21 @@ RunningMedian rpmSamples = RunningMedian(5);
 #define B_VALUE 3950
 #define SMOOTHING_FACTOR 5
 #define eeAddress 10
-Thermistor *thermistor = NULL;
-
-static int serial_putc(const char c, FILE *stream) { return Serial.write(c); }
-static FILE *serial_stream = fdevopen(serial_putc, NULL);
-
 #define PIN_SENSE 2            // where we connected the fan sense pin. Must be an interrupt capable pin (2 or 3 on Arduino Uno)
 #define PIN_PWM 9              // where we connected the fan PWM pin
 #define DEBOUNCE 20            // 0 is fine for most fans, crappy fans may require 10 or 20 to filter out noise
 #define FANSTUCK_THRESHOLD 500 // if no interrupts were received for 500ms, consider the fan as stuck and report 0 RPM
-// Interrupt handler. Stores the timestamps of the last 2 interrupts and handles debouncing
-unsigned long volatile lastINT = 0;
 
-#define MIN_T 22.0
-#define MIN_RPM 2000
-#define MAX_T 35.0
-#define MAX_PWM 1.0
+RunningMedian rpmSamples = RunningMedian(7);
+Thermistor *thermistor = NULL;
+
+// static int serial_putc(const char c, FILE *stream) { return Serial.write(c); }
+// static FILE *serial_stream = fdevopen(serial_putc, NULL);
+
+// Interrupt handler. Stores the timestamps of the last 2 interrupts and handles debouncing
+unsigned long volatile lastINT = 0, lastHit = 0;
+static float min_pwm;
+StreamEx mySerial = Serial;
 enum opStates
 {
   STABILIZE_FAN,
@@ -38,7 +41,6 @@ enum opStates
   SCALE_FAN,
   INVALID_NTC
 };
-
 enum opStates modeState;
 
 void tachISR()
@@ -89,7 +91,7 @@ void setPWMpin(uint8_t pin, float dutyCycle)
   }
 }
 
-float getPWMpin(uint8_t pin)
+double getPWMpin(uint8_t pin)
 {
   uint16_t duty;
   switch (pin)
@@ -105,16 +107,14 @@ float getPWMpin(uint8_t pin)
   }
   return duty / 320.0;
 }
-static float min_pwm;
+
 void setup()
 {
-  stdout = serial_stream;
+  // stdout = serial_stream;
   Serial.begin(9600);
   pinMode(PIN_SENSE, INPUT_PULLUP);                                    // set the sense pin as input with pullup resistor
   attachInterrupt(digitalPinToInterrupt(PIN_SENSE), tachISR, FALLING); // set tachISR to be triggered when the signal on the sense pin goes low
 
-  // enable serial so we can see the RPM in the serial monitor
-  // enable outputs for Timer 1
   pinMode(9, OUTPUT); // 1A
   setupTimer1();
 
@@ -129,7 +129,7 @@ void setup()
       B_VALUE);
   thermistor = new SmoothThermistor(originThermistor, SMOOTHING_FACTOR);
   modeState = STABILIZE_FAN;
-  delay(1500);
+  delay(2000);
 }
 
 float mapfloat(float x, float in_min, float in_max, float out_min, float out_max)
@@ -142,63 +142,94 @@ void loop()
   delay(200);
   if (millis() - lastINT > FANSTUCK_THRESHOLD)
     rpmSamples.add(0);
+
   auto pwm = getPWMpin(PIN_PWM);
   if (rpmSamples.getMedianAverage(3) < 100)
     modeState = STABILIZE_FAN;
+
   float celsius = thermistor->readCelsius();
 
-  printf("RPM: %lu PWM: %u  T:", rpmSamples.getMedianAverage(3), (uint16_t)(pwm * 100));
-  Serial.println(celsius);
-  // increase the duty cycle by 2% every until fan is spinning
-  if (modeState == STABILIZE_FAN)
+  mySerial.printf("%d:RPM: %2.2f PWM: %2.2f  T:%2.2f\n", modeState, rpmSamples.getMedianAverage(3), pwm, celsius);
+
+  switch (modeState)
   {
-    if (rpmSamples.getMedianAverage(3) < 100)
+  case STABILIZE_FAN:
+  {
+
+    if (rpmSamples.getMedianAverage(3) < MIN_RPM - 200)
     {
-      printf("stabilize PWM: %u\n", (uint16_t)(pwm * 100));
-      setPWMpin(PIN_PWM, pwm + 0.1f);
+      mySerial.printf("%d:stabilize PWM: %u\n", modeState, (uint16_t)(pwm * 100));
+      setPWMpin(PIN_PWM, pwm + 0.05f);
       return;
     }
-    else if (abs(rpmSamples.getMedianAverage(3) - MIN_RPM > 200))
+    else
     {
       modeState = CALIBRATE_FAN;
       return;
     }
-    else
-      modeState = SCALE_FAN;
-    return;
+    break;
   }
-  else if (modeState == CALIBRATE_FAN)
+
+  case CALIBRATE_FAN:
   {
-    if (rpmSamples.getMedianAverage(3) < MIN_RPM - 50)
+    auto rp = rpmSamples.getMedianAverage(3);
+    if (abs(rp - MIN_RPM) > 10)
     {
-      printf("calibrate PWM: %u\n", (uint16_t)(pwm * 100));
-      setPWMpin(PIN_PWM, pwm + 0.01f);
+      // mySerial.printf("%d:calibrate PWM: %u\n", modeState, (uint16_t)(pwm * 100));f
+      mySerial.printf("factor: %.3f", (((MIN_RPM / rp - 1.0) / 100.0) + 1.0));
+      setPWMpin(PIN_PWM, pwm * (((MIN_RPM / rp - 1.0) / 5.0) + 1.0));
+      lastHit = 0;
       return;
     }
-    else if (rpmSamples.getMedianAverage(3) > MIN_RPM + 50)
+    // else if (rpmSamples.getMedianAverage(3) > MIN_RPM + 10)
+    // {
+    //   // mySerial.printf("%d:calibrate PWM: %u\n", modeState, (uint16_t)(pwm * 100));
+    //   setPWMpin(PIN_PWM, pwm - 0.001f);
+    //   lastHit=0;
+    //   return;
+    // }
+    else if (lastHit == 0)
     {
-      printf("calibrate PWM: %u\n", (uint16_t)(pwm * 100));
-      setPWMpin(PIN_PWM, pwm - 0.01f);
+      lastHit = millis();
       return;
     }
-    else
+    else if (millis() - lastHit > STABILIZE_TIME)
     {
-      printf("new calibrate point PWM: %u\n", (uint16_t)(pwm * 100));
-      min_pwm = pwm;
-      EEPROM.put(eeAddress, min_pwm);
+      mySerial.printf("%d:new calibrate point PWM: %u\n", modeState, (uint16_t)(pwm * 100));
+      if (min_pwm != pwm)
+      {
+        min_pwm = pwm;
+        EEPROM.put(eeAddress, min_pwm);
+      }
       modeState = SCALE_FAN;
       return;
     }
+    break;
   }
-  else if (modeState == SCALE_FAN)
+
+  case SCALE_FAN:
   {
-    if (celsius < 0 or celsius > 100)
-      modeState = INVALID_NTC;
+
+    // if (celsius < 0 or celsius > 100)
+    // {
+    //   modeState = INVALID_NTC;
+    //   return;
+    // }
 
     pwm = mapfloat(celsius, MIN_T, MAX_T, min_pwm, MAX_PWM);
     pwm = constrain(pwm, min_pwm, MAX_PWM);
     setPWMpin(PIN_PWM, pwm);
+    // mySerial.printf("%d:scale PWM: %2.2f\n", modeState, pwm);
+    break;
   }
 
-  
+  default:
+  {
+
+    pwm = 0.5;
+    mySerial.printf("%d:fallback PWM: %2.2f\n", modeState, pwm);
+    setPWMpin(PIN_PWM, pwm);
+    break;
+  }
+  }
 }
