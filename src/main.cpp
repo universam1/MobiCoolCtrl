@@ -5,6 +5,9 @@
 #include <SmoothThermistor.h>
 #include <EEPROM.h>
 
+#include "RunningMedian.h"
+
+RunningMedian rpmSamples = RunningMedian(5);
 #define SENSOR_PIN A1
 #define REFERENCE_RESISTANCE 76000
 #define NOMINAL_RESISTANCE 100000
@@ -22,7 +25,7 @@ static FILE *serial_stream = fdevopen(serial_putc, NULL);
 #define DEBOUNCE 20            // 0 is fine for most fans, crappy fans may require 10 or 20 to filter out noise
 #define FANSTUCK_THRESHOLD 500 // if no interrupts were received for 500ms, consider the fan as stuck and report 0 RPM
 // Interrupt handler. Stores the timestamps of the last 2 interrupts and handles debouncing
-unsigned long volatile ts1 = 0, ts2 = 0;
+unsigned long volatile lastINT = 0;
 
 #define MIN_T 22.0
 #define MIN_RPM 2000
@@ -33,7 +36,7 @@ enum opStates
   STABILIZE_FAN,
   CALIBRATE_FAN,
   SCALE_FAN,
-  NO_NTC
+  INVALID_NTC
 };
 
 enum opStates modeState;
@@ -41,22 +44,15 @@ enum opStates modeState;
 void tachISR()
 {
   unsigned long m = millis();
-  if ((m - ts2) > DEBOUNCE)
+  if (m - lastINT > DEBOUNCE)
   {
-    ts1 = ts2;
-    ts2 = m;
-  }
-}
-// Calculates the RPM based on the timestamps of the last 2 interrupts. Can be called at any time.
-unsigned long calcRPM()
-{
-  if (millis() - ts2 < FANSTUCK_THRESHOLD && ts2 != 0)
-  {
-    return (60000 / (ts2 - ts1)) / 2;
+    rpmSamples.add((60000.0 / (m - lastINT)) / 2.0);
+    lastINT = m;
   }
   else
-    return 0;
+    rpmSamples.add(0);
 }
+
 // configure Timer 1 (pins 9,10) to output 25kHz PWM
 void setupTimer1()
 {
@@ -144,24 +140,25 @@ float mapfloat(float x, float in_min, float in_max, float out_min, float out_max
 void loop()
 {
   delay(200);
-  auto rpm = calcRPM();
+  if (millis() - lastINT > FANSTUCK_THRESHOLD)
+    rpmSamples.add(0);
   auto pwm = getPWMpin(PIN_PWM);
-  if (100 > rpm)
+  if (rpmSamples.getMedianAverage(3) < 100)
     modeState = STABILIZE_FAN;
   float celsius = thermistor->readCelsius();
 
-  printf("RPM: %lu PWM: %u  T:", rpm, (uint16_t)(pwm * 100));
+  printf("RPM: %lu PWM: %u  T:", rpmSamples.getMedianAverage(3), (uint16_t)(pwm * 100));
   Serial.println(celsius);
   // increase the duty cycle by 2% every until fan is spinning
   if (modeState == STABILIZE_FAN)
   {
-    if (100 > rpm)
+    if (rpmSamples.getMedianAverage(3) < 100)
     {
       printf("stabilize PWM: %u\n", (uint16_t)(pwm * 100));
       setPWMpin(PIN_PWM, pwm + 0.1f);
       return;
     }
-    if (abs(rpm - MIN_RPM > 100))
+    else if (abs(rpmSamples.getMedianAverage(3) - MIN_RPM > 200))
     {
       modeState = CALIBRATE_FAN;
       return;
@@ -170,15 +167,15 @@ void loop()
       modeState = SCALE_FAN;
     return;
   }
-  else if (modeState = CALIBRATE_FAN)
+  else if (modeState == CALIBRATE_FAN)
   {
-    if (rpm < MIN_RPM - 50)
+    if (rpmSamples.getMedianAverage(3) < MIN_RPM - 50)
     {
       printf("calibrate PWM: %u\n", (uint16_t)(pwm * 100));
       setPWMpin(PIN_PWM, pwm + 0.01f);
       return;
     }
-    else if (rpm > MIN_RPM + 50)
+    else if (rpmSamples.getMedianAverage(3) > MIN_RPM + 50)
     {
       printf("calibrate PWM: %u\n", (uint16_t)(pwm * 100));
       setPWMpin(PIN_PWM, pwm - 0.01f);
@@ -193,12 +190,15 @@ void loop()
       return;
     }
   }
-  else if (modeState = SCALE_FAN)
+  else if (modeState == SCALE_FAN)
   {
     if (celsius < 0 or celsius > 100)
-    modeState = NO_NTC;
+      modeState = INVALID_NTC;
+
     pwm = mapfloat(celsius, MIN_T, MAX_T, min_pwm, MAX_PWM);
     pwm = constrain(pwm, min_pwm, MAX_PWM);
     setPWMpin(PIN_PWM, pwm);
   }
+
+  
 }
