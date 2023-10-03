@@ -13,7 +13,7 @@
 #define MAX_T 35.0
 #define MAX_RPM 1000
 #define MAX_PWM_VALUE 320
-#define MIN_RPM_AT_PWM MAX_PWM_VALUE * 0.35
+#define MIN_RPM_AT_PWM MAX_PWM_VALUE * 0.65
 #define SENSOR_PIN A1
 #define REFERENCE_RESISTANCE 76000
 #define NOMINAL_RESISTANCE 100000
@@ -34,15 +34,15 @@ unsigned long volatile lastINT = 0;
 float SetpointRPM = MIN_RPM,
       CurrentRPM = 0,
       PWM = MIN_RPM_AT_PWM,
-      Kp, Ki, Kd;
+      Kp=0.35, Ki=0.001, Kd=0.0;
 QuickPID myPID(&CurrentRPM, &PWM, &SetpointRPM,
                Kp, Ki, Kd,                   // Kp, Ki, Kd,
-               QuickPID::pMode::pOnMeas,        /* pOnError, pOnMeas, pOnErrorMeas */
-               QuickPID::dMode::dOnMeas,        /* dOnError, dOnMeas */
+               QuickPID::pMode::pOnError,        /* pOnError, pOnMeas, pOnErrorMeas */
+               QuickPID::dMode::dOnError,        /* dOnError, dOnMeas */
                QuickPID::iAwMode::iAwCondition, /* iAwCondition, iAwClamp, iAwOff */
                QuickPID::Action::direct);       /* direct, reverse */
 
-sTune tuner = sTune(&CurrentRPM, &PWM, tuner.ZN_PID, tuner.directIP, tuner.printSUMMARY);
+// sTune tuner = sTune(&CurrentRPM, &PWM, tuner.ZN_PID, tuner.directIP, tuner.printSUMMARY);
 
 void tachISR()
 {
@@ -102,40 +102,41 @@ void setup()
   thermistor = new SmoothThermistor(originThermistor, SMOOTHING_FACTOR);
 
   myPID.SetOutputLimits(MIN_RPM_AT_PWM / 2, MAX_PWM_VALUE);
-  delay(1500); // wait for the fan to spin up
+  // delay(500); // wait for the fan to spin up
   // CurrentRPM = rpmSamples.getMedianAverage(SMOOTHING_FACTOR);
-  // myPID.SetMode(QuickPID::Control::automatic);
-
-  tuner.Configure(MAX_RPM, MAX_PWM_VALUE, 50, 30, 30, 3, 9);
+  myPID.SetMode(QuickPID::Control::automatic);
+// tuner.Configure(inputSpan, outputSpan, outputStart, outputStep, testTimeSec, settleTimeSec, samples);
+  // tuner.Configure(MAX_RPM, 150, 170, 290, 15, 3, 9);
 }
 
 void loop()
 {
-  delay(100);
+  delay(500);
   if (millis() - lastINT > FANSTUCK_THRESHOLD)
     rpmSamples.add(0);
 
   auto tempC = thermistor->readCelsius();
   CurrentRPM = rpmSamples.getMedianAverage(SMOOTHING_FACTOR);
 
-  switch (tuner.Run())
-  {
-  case tuner.sample: // active once per sample during test
-    tuner.plotter(CurrentRPM, PWM, SetpointRPM, 1, 1);
-    break;
+  // switch (tuner.Run())
+  // {
+  // case tuner.sample: // active once per sample during test
+  //   tuner.plotter(CurrentRPM, PWM, SetpointRPM, 1, 1);
+  //   break;
 
-  case tuner.tunings:                            // active just once when sTune is done
-    tuner.GetAutoTunings(&Kp, &Ki, &Kd);         // sketch variables updated by sTune
-    myPID.SetTunings(Kp, Ki, Kd);                // update PID with the new tunings
-    myPID.SetMode(QuickPID::Control::automatic); // the PID is turned on
-    break;
+  // case tuner.tunings:                            // active just once when sTune is done
+  //   tuner.GetAutoTunings(&Kp, &Ki, &Kd);         // sketch variables updated by sTune
+  //   myPID.SetTunings(Kp, Ki, Kd);                // update PID with the new tunings
+  //   myPID.SetMode(QuickPID::Control::automatic); // the PID is turned on
+  //   break;
 
-  case tuner.runPid: // active once per sample after tunings
+  // case tuner.runPid: // active once per sample after tunings
     SetpointRPM = mapConstrainf(tempC, MIN_T, MAX_T, MIN_RPM, MAX_RPM);
     myPID.Compute();
-    tuner.plotter(CurrentRPM, PWM, SetpointRPM, 1, 1);
-    break;
-  }
+  //   tuner.plotter(CurrentRPM, PWM, SetpointRPM, 1, 1);
+  //   break;
+  // }
   setPWMpin(PIN_PWM, PWM);
-  mySerial.printf("RPM: %f\tSP: %f\tPWM: %f\tT:%2.2f\n", CurrentRPM, SetpointRPM, PWM, tempC);
+  mySerial.printf(">RPM:%f\n>SP:%f\n>PWM:%f\n>T:%2.2f\n", CurrentRPM, SetpointRPM, PWM, tempC);
+  // mySerial.printf("RPM: %f\tSP: %f\tPWM: %f\tT:%2.2f\n", CurrentRPM, SetpointRPM, PWM, tempC);
 }
